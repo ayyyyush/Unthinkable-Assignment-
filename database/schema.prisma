@@ -1,0 +1,389 @@
+// ────────────────────────────────────────────────────────────────────────────
+// Healthcare Appointment & Follow-up Manager — Data Model
+//
+// Design notes (read before editing):
+//
+// 1. No separate `Admin` table. An admin is a `User` with role = ADMIN and
+//    zero extra profile fields. A join table for nothing is worse schema
+//    design than no table at all.
+//
+// 2. `AppointmentSlot` is the single source of truth for concurrency safety.
+//    The unique constraint on (doctorId, startTime) plus the conditional
+//    status transition in the booking engine (see src/backend/booking.ts) is what
+//    actually prevents double-booking — not application-level locking.
+//
+// 3. All timestamps are stored as UTC `DateTime`. Each user carries an
+//    explicit IANA `timezone` string; conversion to local time happens only
+//    at display/calendar-sync boundaries, never in storage or comparison
+//    logic. This is what makes DST and cross-timezone doctor/patient pairs
+//    safe by construction.
+//
+// 4. `Appointment` and `AppointmentSlot` are separate rows on purpose: a slot
+//    can exist (and be held) before an appointment is ever confirmed. This
+//    is the schema-level expression of the "hold, then confirm" flow.
+// ────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────────────────
+
+enum Role {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum SlotStatus {
+  AVAILABLE
+  HELD
+  BOOKED
+  CANCELLED // slot pulled due to doctor leave; never regenerated for that date
+}
+
+enum AppointmentStatus {
+  PENDING_SYMPTOMS // slot HELD, symptom form not yet submitted
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  RESCHEDULED // superseded by a new Appointment row; kept for audit history
+}
+
+enum Urgency {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum NotificationType {
+  BOOKING_CONFIRMATION
+  APPOINTMENT_REMINDER
+  CANCELLATION
+  RESCHEDULE
+  MEDICATION_REMINDER
+  DOCTOR_LEAVE
+  FOLLOW_UP_REMINDER
+}
+
+enum NotificationChannel {
+  EMAIL
+  CALENDAR
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  RETRYING
+}
+
+// ── Identity ─────────────────────────────────────────────────────────────
+
+model User {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  passwordHash      String
+  role              Role
+  firstName         String
+  lastName          String
+  timezone          String    @default("UTC") // IANA tz, e.g. "Asia/Kolkata"
+  emailVerified     Boolean   @default(false)
+  emailVerifyToken  String?   @unique
+  emailVerifyExpiresAt DateTime?
+  resetToken        String?   @unique
+  resetTokenExpiresAt DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  patientProfile    PatientProfile?
+  doctorProfile     DoctorProfile?
+
+  refreshTokens     RefreshToken[]
+  auditLogs         AuditLog[]
+  notifications     Notification[]
+  calendarAuth      GoogleCalendarAuth?
+
+  @@index([role])
+}
+
+// Rotating refresh tokens, stored hashed. `familyId` groups every token
+// descended from one login; reuse of an already-rotated token revokes the
+// whole family (handles refresh-token theft).
+model RefreshToken {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash     String    @unique
+  familyId      String
+  revoked       Boolean   @default(false)
+  replacedById  String?
+  expiresAt     DateTime
+  createdAt     DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+model GoogleCalendarAuth {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken   String
+  refreshToken  String
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// ── Profiles ─────────────────────────────────────────────────────────────
+
+model PatientProfile {
+  id             String    @id @default(cuid())
+  userId         String    @unique
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dateOfBirth    DateTime?
+  phone          String?
+  medicalHistory String?   // free-text summary; kept minimal by design
+
+  appointments   Appointment[]
+  prescriptions  Prescription[]
+  reminderJobs   ReminderJob[]
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+model DoctorProfile {
+  id             String    @id @default(cuid())
+  userId         String    @unique
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  specialization String
+  bio            String?
+  slotDurationMinutes Int  @default(30)
+  workingHours   WorkingHour[]
+  leaves         DoctorLeave[]
+  slots          AppointmentSlot[]
+  appointments   Appointment[]
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([specialization])
+}
+
+// Recurring weekly availability, e.g. Mon 09:00–17:00. Used by the slot
+// generator to materialize AppointmentSlot rows on a rolling window.
+model WorkingHour {
+  id             String   @id @default(cuid())
+  doctorId       String
+  doctor         DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  dayOfWeek      Int      // 0 = Sunday ... 6 = Saturday
+  startMinute    Int      // minutes from midnight, doctor's local time
+  endMinute      Int
+
+  @@index([doctorId])
+}
+
+// A single leave day. Distinct from WorkingHour so history is preserved
+// even after the leave date has passed.
+model DoctorLeave {
+  id             String   @id @default(cuid())
+  doctorId       String
+  doctor         DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  date           DateTime // stored as UTC midnight of the doctor's local date
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  @@index([doctorId, date])
+}
+
+// ── Scheduling core ──────────────────────────────────────────────────────
+
+// The concurrency-safety boundary of the whole system. See booking.ts.
+model AppointmentSlot {
+  id             String     @id @default(cuid())
+  doctorId       String
+  doctor         DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  startTime      DateTime   // UTC
+  endTime        DateTime   // UTC
+  status         SlotStatus @default(AVAILABLE)
+
+  heldByPatientId String?
+  holdExpiresAt   DateTime?
+
+  appointment    Appointment?
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  // The constraint that makes double-booking structurally impossible:
+  // two rows for the same doctor at the same start time cannot both exist.
+  @@unique([doctorId, startTime])
+  @@index([doctorId, status])
+  @@index([holdExpiresAt])
+}
+
+model Appointment {
+  id             String            @id @default(cuid())
+  slotId         String            @unique
+  slot           AppointmentSlot   @relation(fields: [slotId], references: [id])
+  doctorId       String
+  doctor         DoctorProfile     @relation(fields: [doctorId], references: [id])
+  patientId      String
+  patient        PatientProfile    @relation(fields: [patientId], references: [id])
+  status         AppointmentStatus @default(PENDING_SYMPTOMS)
+
+  supersededById String?           // set when rescheduled to a new Appointment
+  cancelReason   String?
+
+  symptom        Symptom?
+  clinicalNote   ClinicalNote?
+  calendarEvents CalendarEvent[]
+  reminderJobs   ReminderJob[]
+
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@index([doctorId, status])
+  @@index([patientId, status])
+}
+
+// ── Symptoms & AI ────────────────────────────────────────────────────────
+
+model Symptom {
+  id             String   @id @default(cuid())
+  appointmentId  String   @unique
+  appointment    Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  rawText        String
+  submittedAt    DateTime @default(now())
+
+  aiSummary      AISummary?
+}
+
+// Structured pre-visit AI output. `raw` retains the untouched model
+// response for audit/debugging even if `parsed` fields fail validation.
+model AISummary {
+  id               String   @id @default(cuid())
+  symptomId        String   @unique
+  symptom          Symptom  @relation(fields: [symptomId], references: [id], onDelete: Cascade)
+  urgency          Urgency?
+  chiefComplaint   String?
+  riskIndicators    String[] @default([])
+  suggestedQuestions String[] @default([])
+  likelyDepartment String?
+  confidenceLevel  Float?
+  promptVersion    String
+  raw              Json?
+  isFallback       Boolean  @default(false)
+  attempts         Int      @default(1)
+  createdAt        DateTime @default(now())
+}
+
+model ClinicalNote {
+  id              String   @id @default(cuid())
+  appointmentId   String   @unique
+  appointment     Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  notes           String
+  createdAt       DateTime @default(now())
+
+  prescription    Prescription?
+  patientSummary  PatientSummary?
+}
+
+model Prescription {
+  id              String   @id @default(cuid())
+  clinicalNoteId  String   @unique
+  clinicalNote    ClinicalNote @relation(fields: [clinicalNoteId], references: [id], onDelete: Cascade)
+  patientId       String
+  patient         PatientProfile @relation(fields: [patientId], references: [id])
+  medications     Json     // [{ name, dosage, frequencyPerDay, durationDays }]
+  createdAt       DateTime @default(now())
+}
+
+// Structured post-visit AI output shown to the patient.
+model PatientSummary {
+  id                String   @id @default(cuid())
+  clinicalNoteId    String   @unique
+  clinicalNote      ClinicalNote @relation(fields: [clinicalNoteId], references: [id], onDelete: Cascade)
+  summaryText       String
+  medicationSchedule Json?
+  followUpSteps     String[] @default([])
+  lifestyleAdvice   String[] @default([])
+  dietRecommendations String[] @default([])
+  emergencyWarning  String?
+  promptVersion     String
+  raw               Json?
+  isFallback        Boolean  @default(false)
+  attempts          Int      @default(1)
+  createdAt         DateTime @default(now())
+}
+
+// ── Background work & notifications ──────────────────────────────────────
+
+model ReminderJob {
+  id             String   @id @default(cuid())
+  appointmentId  String?
+  appointment    Appointment? @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  patientId      String
+  patient        PatientProfile @relation(fields: [patientId], references: [id])
+  kind           String   // "APPOINTMENT_REMINDER" | "MEDICATION_REMINDER" | "FOLLOW_UP"
+  runAt          DateTime
+  processedAt    DateTime?
+  status         NotificationStatus @default(PENDING)
+  payload        Json?
+
+  @@index([runAt, status])
+}
+
+model CalendarEvent {
+  id             String   @id @default(cuid())
+  appointmentId  String
+  appointment    Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  userId         String   // whose calendar this event lives in
+  googleEventId  String?
+  status         NotificationStatus @default(PENDING)
+  lastError      String?
+  attempts       Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([appointmentId])
+}
+
+model Notification {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type           NotificationType
+  channel        NotificationChannel
+  status         NotificationStatus @default(PENDING)
+  subject        String?
+  body           String?
+  lastError      String?
+  attempts       Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([status, attempts])
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  userId         String?
+  user           User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action         String   // e.g. "APPOINTMENT_BOOKED", "LEAVE_MARKED"
+  entityType     String
+  entityId       String
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId])
+}

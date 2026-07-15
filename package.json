@@ -1,0 +1,58 @@
+{
+  "name": "healthcare-appointment-manager",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prisma:generate": "prisma generate --schema=database/schema.prisma",
+    "prisma:migrate": "prisma migrate dev --schema=database/schema.prisma",
+    "prisma:seed": "tsx database/seed.ts",
+    "cron:local": "tsx scripts/run-cron-locally.ts"
+  },
+  "prisma": {
+    "schema": "database/schema.prisma",
+    "seed": "tsx database/seed.ts"
+  },
+  "dependencies": {
+    "next": "15.0.3",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "@prisma/client": "5.20.0",
+    "bcryptjs": "2.4.3",
+    "jsonwebtoken": "9.0.2",
+    "zod": "3.23.8",
+    "react-hook-form": "7.53.0",
+    "@hookform/resolvers": "3.9.0",
+    "@tanstack/react-query": "5.59.0",
+    "zustand": "4.5.5",
+    "framer-motion": "11.11.9",
+    "nodemailer": "6.9.15",
+    "googleapis": "144.0.0",
+    "date-fns": "4.1.0",
+    "date-fns-tz": "3.2.0",
+    "clsx": "2.1.1",
+    "tailwind-merge": "2.5.4"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3",
+    "@types/node": "22.7.5",
+    "@types/react": "19.0.1",
+    "@types/react-dom": "19.0.1",
+    "@types/bcryptjs": "2.4.6",
+    "@types/jsonwebtoken": "9.0.7",
+    "@types/nodemailer": "6.4.16",
+    "tailwindcss": "3.4.14",
+    "postcss": "8.4.47",
+    "autoprefixer": "10.4.20",
+    "prisma": "5.20.0",
+    "vitest": "2.1.2",
+    "tsx": "4.19.1",
+    "eslint": "8.57.1",
+    "eslint-config-next": "15.0.3"
+  }
+}
